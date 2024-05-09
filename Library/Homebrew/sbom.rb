@@ -12,12 +12,9 @@ class SBOM
   extend Cachable
 
   FILENAME = "sbom.spdx.json"
-  SCHEMA = "https://raw.githubusercontent.com/spdx/spdx-spec/v2.3/schemas/spdx-schema.json"
-
-  attr_accessor :homebrew_version, :spdxfile, :built_as_bottle, :installed_as_dependency, :installed_on_request,
-                :changed_files, :poured_from_bottle, :loaded_from_api, :time, :stdlib, :aliases, :arch, :source,
-                :built_on, :license, :name
-  attr_writer :compiler, :runtime_dependencies, :source_modified_time
+  SCHEMA_URL = "https://spdx.github.io/spdx-3-model/model.jsonld"
+  SCHEMA_FILENAME = "sbom.spdx.schema.3.json"
+  SCHEMA_CACHE_TARGET = (HOMEBREW_CACHE/"sbom/#{SCHEMA_FILENAME}").freeze
 
   # Instantiates a {SBOM} for a new installation of a formula.
   sig { params(formula: Formula, compiler: T.nilable(String), stdlib: T.nilable(String)).returns(T.attached_class) }
@@ -27,7 +24,7 @@ class SBOM
     attributes = {
       name:                    formula.name,
       homebrew_version:        HOMEBREW_VERSION,
-      spdxfile:                formula.prefix/FILENAME,
+      spdxfile:                SBOM.spdxfile(formula),
       built_as_bottle:         formula.build.bottle?,
       installed_as_dependency: false,
       installed_on_request:    false,
@@ -63,49 +60,126 @@ class SBOM
     new(attributes)
   end
 
-  sig { params(attributes: Hash).void }
-  def initialize(attributes = {})
-    attributes.each { |key, value| instance_variable_set(:"@#{key}", value) }
+  sig { params(formula: Formula).returns(Pathname) }
+  def self.spdxfile(formula)
+    formula.prefix/FILENAME
+  end
+
+  sig { params(deps: T::Array[Formula]).returns(T::Array[T::Hash[Symbol, String]]) }
+  def self.runtime_deps_hash(deps)
+    deps.map do |dep|
+      {
+        full_name:         dep.full_name,
+        name:              dep.name,
+        version:           dep.version.to_s,
+        revision:          dep.revision,
+        pkg_version:       dep.pkg_version.to_s,
+        declared_directly: true,
+        license:           SPDX.license_expression_to_string(dep.license),
+        bottle:            dep.bottle_hash,
+      }
+    end
+  end
+
+  sig { params(formula: Formula).returns(T::Boolean) }
+  def self.exist?(formula)
+    spdxfile(formula).exist?
+  end
+
+  sig { returns(T::Hash[String, String]) }
+  def self.fetch_schema!
+    return @schema if @schema.present?
+
+    url = SCHEMA_URL
+    target = SCHEMA_CACHE_TARGET
+    quieter = target.exist? && !target.empty?
+
+    curl_args = Utils::Curl.curl_args(retries: 0)
+    curl_args += ["--silent", "--time-cond", target.to_s] if quieter
+
+    begin
+      unless quieter
+        oh1 "Fetching SBOM schema"
+        ohai "Downloading #{url}"
+      end
+      Utils::Curl.curl_download(*curl_args, url, to: target, retries: 0)
+      FileUtils.touch(target, mtime: Time.now)
+    rescue ErrorDuringExecution
+      target.unlink if target.exist? && target.empty?
+
+      if target.exist?
+        opoo "SBOM schema update failed, falling back to cached version."
+      else
+        opoo "Failed to fetch SBOM schema, cannot perform SBOM validation!"
+
+        return {}
+      end
+    end
+
+    @schema = begin
+      JSON.parse(target.read, freeze: true)
+    rescue JSON::ParserError
+      target.unlink
+      opoo "Failed to fetch SBOM schema, cached version corrupted, cannot perform SBOM validation!"
+      {}
+    end
   end
 
   sig { returns(T::Boolean) }
   def valid?
+    unless require? "json_schemer"
+      error_message = "Need json_schemer to validate SBOM, run `brew install-bundler-gems --add-groups=bottle`!"
+      odie error_message if ENV["HOMEBREW_ENFORCE_SBOM"]
+      return false
+    end
+
+    schema = SBOM.fetch_schema!
+    if schema.blank?
+      error_message = "Could not fetch JSON schema to validate SBOM!"
+      ENV["HOMEBREW_ENFORCE_SBOM"] ? odie(error_message) : opoo(error_message)
+      return false
+    end
+
+    schemer = JSONSchemer.schema(schema)
     data = to_spdx_sbom
-
-    schema_string, _, status = Utils::Curl.curl_output(SCHEMA)
-
-    opoo "Failed to fetch schema!" unless status.success?
-
-    require "json_schemer"
-
-    schemer = JSONSchemer.schema(schema_string)
-
     return true if schemer.valid?(data)
 
     opoo "SBOM validation errors:"
     schemer.validate(data).to_a.each do |error|
-      ohai error["error"]
+      puts error["error"]
     end
 
-    odie "Failed to validate SBOM agains schema!" if ENV["HOMEBREW_ENFORCE_SBOM"]
+    odie "Failed to validate SBOM against JSON schema!" if ENV["HOMEBREW_ENFORCE_SBOM"]
 
     false
   end
 
-  sig { void }
-  def write
+  sig { params(validate: T::Boolean).void }
+  def write(validate: true)
     # If this is a new installation, the cache of installed formulae
     # will no longer be valid.
     Formula.clear_cache unless spdxfile.exist?
 
     self.class.cache[spdxfile] = self
 
-    unless valid?
+    if validate && !valid?
       opoo "SBOM is not valid, not writing to disk!"
       return
     end
 
     spdxfile.atomic_write(JSON.pretty_generate(to_spdx_sbom))
+  end
+
+  private
+
+  attr_accessor :homebrew_version, :spdxfile, :built_as_bottle, :installed_as_dependency, :installed_on_request,
+                :changed_files, :poured_from_bottle, :loaded_from_api, :time, :stdlib, :aliases, :arch, :source,
+                :built_on, :license, :name
+  attr_writer :compiler, :runtime_dependencies, :source_modified_time
+
+  sig { params(attributes: Hash).void }
+  def initialize(attributes = {})
+    attributes.each { |key, value| instance_variable_set(:"@#{key}", value) }
   end
 
   sig { params(runtime_dependency_declaration: T::Array[Hash], compiler_declaration: Hash).returns(T::Array[Hash]) }
@@ -293,24 +367,6 @@ class SBOM
       relationships:     generate_relations_json(runtime_full, compiler_info),
     }
   end
-
-  sig { params(deps: T::Array[Formula]).returns(T::Array[T::Hash[Symbol, String]]) }
-  def self.runtime_deps_hash(deps)
-    deps.map do |dep|
-      {
-        full_name:         dep.full_name,
-        name:              dep.name,
-        version:           dep.version.to_s,
-        revision:          dep.revision,
-        pkg_version:       dep.pkg_version.to_s,
-        declared_directly: true,
-        license:           SPDX.license_expression_to_string(dep.license),
-        bottle:            dep.bottle_hash,
-      }
-    end
-  end
-
-  private
 
   sig { params(base: T.nilable(T::Hash[String, Hash])).returns(T.nilable(T::Hash[String, String])) }
   def get_bottle_info(base)

@@ -96,12 +96,12 @@ module Homebrew
 
       sig { override.void }
       def run
-        Homebrew.install_bundler_gems!(groups: ["bottle"])
-
         if args.merge?
           Homebrew.install_bundler_gems!(groups: ["ast"])
           return merge
         end
+
+        Homebrew.install_bundler_gems!(groups: ["bottle"])
 
         gnu_tar_formula_ensure_installed_if_needed!
 
