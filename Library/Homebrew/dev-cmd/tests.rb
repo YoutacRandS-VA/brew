@@ -246,6 +246,9 @@ module Homebrew
         ENV["HOMEBREW_TEST_ONLINE"] = "1" if args.online?
         ENV["HOMEBREW_SORBET_RUNTIME"] = "1"
 
+        # We don't want tests to change behaviour based on where they are run.
+        ENV.delete("GITHUB_ACTIONS")
+
         # TODO: remove this and fix tests when possible.
         ENV["HOMEBREW_NO_INSTALL_FROM_API"] = "1"
         ENV.delete("HOMEBREW_INTERNAL_JSON_V3")
